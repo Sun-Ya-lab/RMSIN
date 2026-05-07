@@ -218,7 +218,7 @@ class PyramidPoolAgg(nn.Module):
         return torch.cat([nn.functional.adaptive_avg_pool2d(inp, (H, W)) for inp in inputs], dim=1)
 
 
-class SaccadeMLP(nn.Module):
+class NormMLP(nn.Module):
     """LayerNorm + MLP transform applied per-position (replaces VSSM)."""
     def __init__(self, dim, mlp_ratio=2):
         super().__init__()
@@ -251,7 +251,7 @@ class LanguagePreAlignment(nn.Module):
             nn.Linear(lang_dim, c * 3) for c in channels
         ])
         self.transforms = nn.ModuleList([
-            SaccadeMLP(c, mlp_ratio) for c in channels
+            NormMLP(c, mlp_ratio) for c in channels
         ])
         for m in self.modulators:
             nn.init.zeros_(m.weight)
