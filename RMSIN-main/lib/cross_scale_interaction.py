@@ -218,12 +218,76 @@ class PyramidPoolAgg(nn.Module):
         return torch.cat([nn.functional.adaptive_avg_pool2d(inp, (H, W)) for inp in inputs], dim=1)
 
 
+class NormMLP(nn.Module):
+    """LayerNorm + MLP transform applied per-position (replaces VSSM)."""
+    def __init__(self, dim, mlp_ratio=2):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        hidden = dim * mlp_ratio
+        self.fc1 = nn.Linear(dim, hidden)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden, dim)
+
+    def forward(self, x):  # x: (B, C, H, W)
+        B, C, H, W = x.shape
+        y = x.permute(0, 2, 3, 1)  # (B, H, W, C)
+        y = self.norm(y)
+        y = self.fc2(self.act(self.fc1(y)))
+        return y.permute(0, 3, 1, 2).contiguous()
+
+
+class LanguagePreAlignment(nn.Module):
+    """Saccade-inspired global language pre-alignment.
+
+    For each scale F_t, pool the language feature, generate three modulation
+    factors (alpha, beta, gamma) via Linear(AvgPool(L)), then transform F_t
+    with LayerNorm+MLP and apply FiLM-style modulation as a global
+    language-conditioned alignment before CIM.
+    """
+    def __init__(self, channels, lang_dim=768, mlp_ratio=2):
+        super().__init__()
+        self.channels = channels
+        self.modulators = nn.ModuleList([
+            nn.Linear(lang_dim, c * 3) for c in channels
+        ])
+        self.transforms = nn.ModuleList([
+            NormMLP(c, mlp_ratio) for c in channels
+        ])
+        for m in self.modulators:
+            nn.init.zeros_(m.weight)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, feats, l, l_mask=None):
+        # l: (B, lang_dim, N_l); l_mask: (B, N_l, 1) or None
+        if l_mask is not None:
+            mask = l_mask.squeeze(-1) if l_mask.dim() == 3 else l_mask
+            mask = mask.unsqueeze(1).to(l.dtype)  # (B, 1, N_l)
+            l_pool = (l * mask).sum(dim=2) / (mask.sum(dim=2) + 1e-6)
+        else:
+            l_pool = l.mean(dim=2)
+
+        out = []
+        for i, x in enumerate(feats):
+            B, C, _, _ = x.shape
+            abc = self.modulators[i](l_pool)
+            alpha, beta, gamma = abc.chunk(3, dim=-1)
+            alpha = alpha.view(B, C, 1, 1)
+            beta = beta.view(B, C, 1, 1)
+            gamma = gamma.view(B, C, 1, 1)
+            y = self.transforms[i](x)
+            out.append(x + (1 + alpha) * y + beta + gamma * x)
+        return out
+
+
 class CIM(nn.Module):
-    def __init__(self, dim, num_layers=1, channels=[128, 256, 512, 1024], downsample=1):
+    def __init__(self, dim, num_layers=1, channels=[128, 256, 512, 1024], downsample=1, lang_dim=768):
         super().__init__()
         self.hidden_dim = dim // 4
         self.channels = channels
         self.stride = downsample
+
+        # Saccade-style global language pre-alignment (before CIM input)
+        self.pre_align = LanguagePreAlignment(channels, lang_dim=lang_dim)
 
         self.down_channel = nn.Conv2d(dim, self.hidden_dim, 1)
         self.up_channel = nn.Conv2d(self.hidden_dim, dim, 1)
@@ -236,11 +300,13 @@ class CIM(nn.Module):
         ])
         self.bn = nn.BatchNorm2d(self.hidden_dim)
         self.fusion = nn.ModuleList([
-            ScaleAwareGate(channels[i], channels[i])  
+            ScaleAwareGate(channels[i], channels[i])
             for i in range(len(channels))
         ])
 
-    def forward(self, input):  # [B, C, H, W]
+    def forward(self, input, l=None, l_mask=None):  # [B, C, H, W]
+        if l is not None:
+            input = self.pre_align(input, l, l_mask)
         out = self.pool(input)
         out = self.down_channel(out)
         for layer in self.block:
@@ -265,6 +331,8 @@ if __name__ == '__main__':
     x3 = torch.randn(2, 512, 30, 30)
     x4 = torch.randn(2, 1024, 15, 15)
     x = tuple([x1, x2, x3, x4])
-    y = model(x)
+    l = torch.randn(2, 768, 20)
+    l_mask = torch.ones(2, 20, 1)
+    y = model(x, l, l_mask)
 
 
