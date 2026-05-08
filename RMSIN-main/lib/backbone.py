@@ -397,6 +397,37 @@ class PositionEmbeddingSine(nn.Module):
         return pos
 
 
+class ShallowDeepFusion(nn.Module):
+    """Inject upsampled deep semantics into the shallow high-resolution map.
+
+    Stage-1 features have rich spatial detail but weak semantics; Stage-4
+    features have strong semantics but very low resolution. We project the
+    deep map to the shallow channel count, upsample, and add it to the
+    shallow map through a learned channel gate. The gate's input projection
+    is zero-initialized so the gate produces 0.5 at start, but the deep
+    projection (with BN) outputs 0 at init, keeping the fusion a no-op
+    until trained.
+    """
+    def __init__(self, shallow_dim, deep_dim):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(deep_dim, shallow_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(shallow_dim),
+        )
+        nn.init.zeros_(self.proj[0].weight)
+        self.gate = nn.Sequential(
+            nn.Conv2d(shallow_dim * 2, shallow_dim, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, shallow, deep):
+        H, W = shallow.shape[-2:]
+        deep_up = self.proj(deep)
+        deep_up = F.interpolate(deep_up, size=(H, W), mode='bilinear', align_corners=False)
+        g = self.gate(torch.cat([shallow, deep_up], dim=1))
+        return shallow + g * deep_up
+
+
 class MultiModalSwinTransformer(nn.Module):
     def __init__(self,
                  pretrain_img_size=224,
@@ -483,6 +514,12 @@ class MultiModalSwinTransformer(nn.Module):
 
         # cross-scale interaction module
         self.cim = CIM(dim=sum(num_features))
+
+        # Shallow-deep visual fusion: enrich the highest-resolution stage-1
+        # output with semantics from the deepest stage-4 output (upsampled),
+        # to recover small-target details lost during deep downsampling.
+        self.shallow_deep_fusion = ShallowDeepFusion(num_features[0], num_features[-1])
+
         self._freeze_stages()
 
     def _freeze_stages(self):
@@ -544,7 +581,11 @@ class MultiModalSwinTransformer(nn.Module):
         outs = []
         for i in range(self.num_layers):
             layer = self.layers[i]
-            x_out, H, W, x, Wh, Ww = layer(x, Wh, Ww, l, l_mask)
+            x_out, H, W, x, Wh, Ww, l_update = layer(x, Wh, Ww, l, l_mask)
+            # Cross-stage language evolution: residual update of language with
+            # the visually-enhanced per-token features produced by this stage.
+            # `l_update` is zero-initialized so initial behavior is unchanged.
+            l = l + l_update
 
             if i in self.out_indices:
                 norm_layer = getattr(self, f'norm{i}')
@@ -554,6 +595,10 @@ class MultiModalSwinTransformer(nn.Module):
                 outs.append(out)
 
         outs = self.cim(outs, l, l_mask)
+        # Shallow-deep visual fusion (encoder end): inject upsampled deepest
+        # features into the highest-resolution map.
+        outs = list(outs)
+        outs[0] = self.shallow_deep_fusion(outs[0], outs[-1])
         return tuple(outs)
 
     def train(self, mode=True):
@@ -673,17 +718,18 @@ class MMBasicLayer(nn.Module):
 
         v_residual = self.visual_residual(x)
 
-        # PWAM fusion
-        x_residual = self.fusion(x, l, l_mask)
+        # PWAM fusion (also returns a language-side residual update from the
+        # L->V branch, used by the encoder to evolve language across stages).
+        x_residual, l_update = self.fusion(x, l, l_mask, return_l_update=True)
         # apply a gate on the residual
         x = x + (self.res_gate(x_residual) * x_residual) + (self.visual_gate(v_residual) * v_residual)
 
         if self.downsample is not None:
             x_down = self.downsample(x, H, W)
             Wh, Ww = (H + 1) // 2, (W + 1) // 2
-            return x_residual, H, W, x_down, Wh, Ww
+            return x_residual, H, W, x_down, Wh, Ww, l_update
         else:
-            return x_residual, H, W, x, H, W
+            return x_residual, H, W, x, H, W, l_update
 
 
 class PWAM(nn.Module):
@@ -708,12 +754,15 @@ class PWAM(nn.Module):
                                         nn.Dropout(dropout)
                                         )
 
-    def forward(self, x, l, l_mask):
+    def forward(self, x, l, l_mask, return_l_update=False):
         # input x shape: (B, H*W, dim)
         vis = self.vis_project(x.permute(0, 2, 1))  # (B, dim, H*W)
         # print(x.shape, l.shape, l_mask.shape)
 
-        lang = self.image_lang_att(x, l, l_mask)  # (B, H*W, dim)
+        if return_l_update:
+            lang, l_update = self.image_lang_att(x, l, l_mask, return_l_update=True)
+        else:
+            lang = self.image_lang_att(x, l, l_mask)  # (B, H*W, dim)
 
         lang = lang.permute(0, 2, 1)  # (B, dim, H*W)
 
@@ -722,6 +771,8 @@ class PWAM(nn.Module):
 
         mm = mm.permute(0, 2, 1)  # (B, H*W, dim)
 
+        if return_l_update:
+            return mm, l_update
         return mm
 
 
@@ -780,7 +831,15 @@ class MutualCrossAttention(nn.Module):
         nn.init.zeros_(self.fg_gate[-1].weight)
         nn.init.zeros_(self.fg_gate[-1].bias)
 
-    def forward(self, x, l, l_mask):
+        # Project the per-token visual context (value space) back to language
+        # channel dim so it can be used as a residual update on the original
+        # language feature for cross-stage language evolution. Zero-init keeps
+        # initial behavior unchanged when loading existing checkpoints.
+        self.l_update_proj = nn.Conv1d(value_channels, l_in_channels, 1)
+        nn.init.zeros_(self.l_update_proj.weight)
+        nn.init.zeros_(self.l_update_proj.bias)
+
+    def forward(self, x, l, l_mask, return_l_update=False):
         # x: (B, HW, v_in); l: (B, l_in, N_l); l_mask: (B, N_l, 1)
         B, HW, _ = x.size()
         N_l = l.size(-1)
@@ -828,7 +887,14 @@ class MutualCrossAttention(nn.Module):
         g = torch.sigmoid(self.fg_gate(fg)).unsqueeze(-1)                          # (B, out, 1)
 
         out = g * out_vl + (1.0 - g) * out_lv                                      # (B, out, HW)
-        return out.permute(0, 2, 1)                                                # (B, HW, out)
+        out = out.permute(0, 2, 1)                                                 # (B, HW, out)
+
+        if return_l_update:
+            # per-token visual context -> language space (B, l_in, N_l)
+            per_tok_flat = per_tok.permute(0, 1, 3, 2).reshape(B, self.value_channels, N_l)
+            l_update = self.l_update_proj(per_tok_flat) * l_mask_t                  # mask padding
+            return out, l_update
+        return out
 
 
 
