@@ -695,12 +695,13 @@ class PWAM(nn.Module):
                                          nn.Dropout(dropout)
                                         )
 
-        self.image_lang_att = SpatialImageLanguageAttention(v_in_channels,  # v_in
-                                                            l_in_channels,  # l_in
-                                                            key_channels,  # key
-                                                            value_channels,  # value
-                                                            out_channels=value_channels,  # out
-                                                            num_heads=num_heads)
+        # SMA-style bidirectional mutual attention with sentence-level Fg gating
+        self.image_lang_att = MutualCrossAttention(v_in_channels,  # v_in
+                                                   l_in_channels,  # l_in
+                                                   key_channels,   # key
+                                                   value_channels, # value
+                                                   out_channels=value_channels,
+                                                   num_heads=num_heads)
 
         self.project_mm = nn.Sequential(nn.Conv1d(value_channels, value_channels, 1, 1),
                                         nn.GELU(),
@@ -722,6 +723,112 @@ class PWAM(nn.Module):
         mm = mm.permute(0, 2, 1)  # (B, H*W, dim)
 
         return mm
+
+
+
+
+class MutualCrossAttention(nn.Module):
+    """CMANet-SMA inspired bidirectional cross attention with Fg modulation.
+
+    Direction 1 (V->L, original): pixels query language tokens, producing
+        per-pixel language context.
+    Direction 2 (L->V, new):       language tokens query pixels, producing
+        per-token visual context, which is then broadcast back to pixels via
+        the V->L attention map (mutual symmetry).
+    The two per-pixel outputs are fused by a gate produced from the
+    sentence-level vector Fg = masked-AvgPool(l).
+    """
+    def __init__(self, v_in_channels, l_in_channels, key_channels, value_channels,
+                 out_channels=None, num_heads=1):
+        super().__init__()
+        self.num_heads = max(num_heads, 1)
+        self.key_channels = key_channels
+        self.value_channels = value_channels
+        self.out_channels = out_channels if out_channels is not None else value_channels
+
+        # ---- V -> L ----
+        self.f_query_v = nn.Sequential(
+            nn.Conv1d(v_in_channels, key_channels, 1),
+            nn.InstanceNorm1d(key_channels),
+        )
+        self.f_key_l = nn.Conv1d(l_in_channels, key_channels, 1)
+        self.f_value_l = nn.Conv1d(l_in_channels, value_channels, 1)
+        self.W_vl = nn.Sequential(
+            nn.Conv1d(value_channels, self.out_channels, 1),
+            nn.InstanceNorm1d(self.out_channels),
+        )
+
+        # ---- L -> V ----
+        self.f_query_l = nn.Conv1d(l_in_channels, key_channels, 1)
+        self.f_key_v = nn.Sequential(
+            nn.Conv1d(v_in_channels, key_channels, 1),
+            nn.InstanceNorm1d(key_channels),
+        )
+        self.f_value_v = nn.Conv1d(v_in_channels, value_channels, 1)
+        self.W_lv = nn.Sequential(
+            nn.Conv1d(value_channels, self.out_channels, 1),
+            nn.InstanceNorm1d(self.out_channels),
+        )
+
+        # ---- Sentence-level Fg gate ----
+        self.fg_gate = nn.Sequential(
+            nn.Linear(l_in_channels, self.out_channels),
+            nn.GELU(),
+            nn.Linear(self.out_channels, self.out_channels),
+        )
+        # zero-init last layer so g starts at 0.5 -> initial behavior averages both directions
+        nn.init.zeros_(self.fg_gate[-1].weight)
+        nn.init.zeros_(self.fg_gate[-1].bias)
+
+    def forward(self, x, l, l_mask):
+        # x: (B, HW, v_in); l: (B, l_in, N_l); l_mask: (B, N_l, 1)
+        B, HW, _ = x.size()
+        N_l = l.size(-1)
+        h = self.num_heads
+        kd = self.key_channels // h
+        vd = self.value_channels // h
+        x_t = x.permute(0, 2, 1)              # (B, v_in, HW)
+        l_mask_t = l_mask.permute(0, 2, 1)    # (B, 1, N_l)
+
+        # ---- V -> L ----
+        q_v = self.f_query_v(x_t)                                                 # (B, key, HW)
+        k_l = self.f_key_l(l) * l_mask_t                                          # (B, key, N_l)
+        v_l = self.f_value_l(l) * l_mask_t                                        # (B, val, N_l)
+        q_v = q_v.reshape(B, h, kd, HW).permute(0, 1, 3, 2)                       # (B,h,HW,kd)
+        k_l = k_l.reshape(B, h, kd, N_l)                                          # (B,h,kd,N_l)
+        v_l = v_l.reshape(B, h, vd, N_l).permute(0, 1, 3, 2)                      # (B,h,N_l,vd)
+        m4 = l_mask_t.unsqueeze(1)                                                # (B,1,1,N_l)
+        sim_vl = (q_v @ k_l) * (kd ** -0.5)                                       # (B,h,HW,N_l)
+        sim_vl = sim_vl + (1e4 * m4 - 1e4)
+        a_vl = F.softmax(sim_vl, dim=-1)
+        out_vl = a_vl @ v_l                                                        # (B,h,HW,vd)
+        out_vl = out_vl.permute(0, 2, 1, 3).reshape(B, HW, self.value_channels)
+        out_vl = self.W_vl(out_vl.permute(0, 2, 1))                                # (B, out, HW)
+
+        # ---- L -> V ----
+        q_l = self.f_query_l(l)                                                   # (B, key, N_l)
+        k_v = self.f_key_v(x_t)                                                   # (B, key, HW)
+        v_v = self.f_value_v(x_t)                                                 # (B, val, HW)
+        q_l = q_l.reshape(B, h, kd, N_l).permute(0, 1, 3, 2)                      # (B,h,N_l,kd)
+        k_v = k_v.reshape(B, h, kd, HW)                                           # (B,h,kd,HW)
+        v_v = v_v.reshape(B, h, vd, HW).permute(0, 1, 3, 2)                       # (B,h,HW,vd)
+        sim_lv = (q_l @ k_v) * (kd ** -0.5)                                       # (B,h,N_l,HW)
+        a_lv = F.softmax(sim_lv, dim=-1)
+        per_tok = a_lv @ v_v                                                       # (B,h,N_l,vd)
+        # zero-out padding tokens so they don't pollute the broadcast back to pixels
+        per_tok = per_tok * m4.permute(0, 1, 3, 2)                                 # mask: (B,1,N_l,1)
+        # Broadcast per-token visual context to per-pixel via the V->L attention map
+        out_lv = a_vl @ per_tok                                                    # (B,h,HW,vd)
+        out_lv = out_lv.permute(0, 2, 1, 3).reshape(B, HW, self.value_channels)
+        out_lv = self.W_lv(out_lv.permute(0, 2, 1))                                # (B, out, HW)
+
+        # ---- Sentence-level Fg gate ----
+        mask = l_mask.squeeze(-1).unsqueeze(1).to(l.dtype)                         # (B, 1, N_l)
+        fg = (l * mask).sum(-1) / (mask.sum(-1) + 1e-6)                            # (B, l_in)
+        g = torch.sigmoid(self.fg_gate(fg)).unsqueeze(-1)                          # (B, out, 1)
+
+        out = g * out_vl + (1.0 - g) * out_lv                                      # (B, out, HW)
+        return out.permute(0, 2, 1)                                                # (B, HW, out)
 
 
 
